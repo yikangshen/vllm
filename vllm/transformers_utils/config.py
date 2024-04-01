@@ -4,12 +4,6 @@ from transformers import AutoConfig, PretrainedConfig
 
 from vllm.transformers_utils.configs import *
 
-from transformers import AutoTokenizer, AutoModelForCausalLM, AutoConfig, AutoModelForSequenceClassification
-from jetmoe import JetMoEForCausalLM, JetMoEConfig, JetMoEForSequenceClassification
-AutoConfig.register("jetmoe", JetMoEConfig)
-AutoModelForCausalLM.register(JetMoEConfig, JetMoEForCausalLM)
-AutoModelForSequenceClassification.register(JetMoEConfig, JetMoEForSequenceClassification)
-
 _CONFIG_REGISTRY = {
     "chatglm": ChatGLMConfig,
     "dbrx": DbrxConfig,
