@@ -1,14 +1,8 @@
 # coding=utf-8
 # Adapted from
 # https://github.com/huggingface/transformers/blob/v4.28.0/src/transformers/models/qwen2_moe/modeling_qwen2_moe.py
-# Copyright 2024 The Qwen team.
+# Copyright 2024 The JetMoE team.
 # Copyright 2023 The vLLM team.
-# Copyright 2022 EleutherAI and the HuggingFace Inc. team. All rights reserved.
-#
-# This code is based on EleutherAI's GPT-NeoX library and the GPT-NeoX
-# and OPT implementations in this library. It has been modified from its
-# original forms to accommodate minor architectural differences compared
-# to GPT-NeoX and OPT used by the Meta AI team that trained the model.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -21,14 +15,13 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Inference-only Qwen2MoE model compatible with HuggingFace weights."""
+"""Inference-only JetMoE2MoE model compatible with HuggingFace weights."""
 from typing import Any, Dict, List, Optional
 
 import torch
 import torch.nn.functional as F
 from torch import nn
 from transformers import PretrainedConfig
-import scattermoe
 
 from vllm.attention import Attention, AttentionMetadata
 from vllm.model_executor.layers.activation import SiluAndMul
@@ -115,6 +108,53 @@ class top_k_gating(nn.Module):
 
         logits = self.layer(x)
         return logits
+    
+
+class ParallelExperts(nn.Module):
+    def __init__(self, num_experts, input_size, output_size, bias=False) -> None:
+        """
+        Initialize the ParallelExperts module.
+
+        Args:
+            num_experts (int): Number of experts.
+            input_size (int): Size of the input.
+            output_size (int): Size of the output.
+            bias (bool): Whether to include bias terms.
+        """
+        super().__init__()
+        self.weight = nn.Parameter(torch.empty(num_experts, output_size, input_size))
+        self.reset_parameters()
+        self.num_experts = num_experts
+        self.input_size = input_size
+        self.output_size = output_size
+
+    def extra_repr(self):
+        return 'num_experts={}, input_size={}, output_size={}'.format(
+            self.num_experts, self.input_size, self.output_size)
+
+    def reset_parameters(self) -> None:
+        """
+        Reset the parameters of the model.
+        """
+        nn.init.uniform_(self.weight, -1. / self.weight.size(1), 1. / self.weight.size(1))
+
+    def forward(self, inputs, expert_size):
+        """
+        Forward pass of the ParallelExperts module.
+
+        Args:
+            inputs (Tensor): Input tensor.
+            expert_size: Expert size information.
+
+        Returns:
+            Tensor: Output tensor.
+        """
+        input_list = inputs.split(expert_size, dim=0)
+        output_list = []
+        for i in range(self.num_experts):
+            output_list.append(F.linear(input_list[i], self.weight[i]))
+        results = torch.cat(output_list, dim=0)
+        return results
 
 
 class MoE(nn.Module):
@@ -150,8 +190,7 @@ class MoE(nn.Module):
             torch.nn.init.zeros_(self.bias)
         else:
             self.bias = None
-        self.input_linear = scattermoe.parallel_experts.ParallelExperts(num_experts, input_size, hidden_size * 2 if glu else hidden_size)
-        self.output_linear = scattermoe.parallel_experts.ParallelExperts(num_experts, hidden_size, input_size)
+        self.output_linear = ParallelExperts(num_experts, hidden_size, input_size)
         self.top_k = min(top_k, self.num_experts)
 
         self.router = top_k_gating(
@@ -605,15 +644,7 @@ class JetMoeForCausalLM(nn.Module):
                      cache_dir: Optional[str] = None,
                      load_format: str = "auto",
                      revision: Optional[str] = None):
-        stacked_params_mapping = [
-            # (param_name, shard_name, shard_id)
-            # ("qkv_proj", "q_proj", "q"),
-            # ("qkv_proj", "k_proj", "k"),
-            # ("qkv_proj", "v_proj", "v"),
-            # ("gate_up_proj", "gate_proj", 0),
-            # ("gate_up_proj", "up_proj", 1),
-        ]
-
+        
         params_dict = dict(self.named_parameters())
         for name, loaded_weight in hf_model_weights_iterator(
                 model_name_or_path,
@@ -623,35 +654,20 @@ class JetMoeForCausalLM(nn.Module):
                 fall_back_to_pt=False):
             if "rotary_emb.inv_freq" in name:
                 continue
-            for (param_name, weight_name, shard_id) in stacked_params_mapping:
-                if weight_name not in name:
-                    continue
-                name = name.replace(weight_name, param_name)
-                # Skip loading extra bias for GPTQ models.
-                if name.endswith(".bias") and name not in params_dict:
-                    continue
-                # Skip experts that are not assigned to this worker.
-                if (("mlp.experts." in name or "mlp.shared_expert." in name)
-                        and name not in params_dict):
-                    continue
-                param = params_dict[name]
-                weight_loader = param.weight_loader
-                weight_loader(param, loaded_weight, shard_id)
-                break
-            else:
-                # Skip loading extra bias for GPTQ models.
-                if name.endswith(".bias") and name not in params_dict:
-                    continue
-                # Skip experts that are not assigned to this worker.
-                if (("mlp.experts." in name or "mlp.shared_expert." in name)
-                        and name not in params_dict):
-                    continue
-                param = params_dict[name]
+            
+            # Skip loading extra bias for GPTQ models.
+            if name.endswith(".bias") and name not in params_dict:
+                continue
+            # Skip experts that are not assigned to this worker.
+            if (("mlp.experts." in name or "mlp.shared_expert." in name)
+                    and name not in params_dict):
+                continue
+            param = params_dict[name]
+            weight_loader = getattr(param, "weight_loader",
+                                    default_weight_loader)
+            weight_loader(param, loaded_weight)
+            if name == "model.embed_tokens.weight":
+                param = params_dict["lm_head.weight"]
                 weight_loader = getattr(param, "weight_loader",
                                         default_weight_loader)
                 weight_loader(param, loaded_weight)
-                if name == "model.embed_tokens.weight":
-                    param = params_dict["lm_head.weight"]
-                    weight_loader = getattr(param, "weight_loader",
-                                            default_weight_loader)
-                    weight_loader(param, loaded_weight)
